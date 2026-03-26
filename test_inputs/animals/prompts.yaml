@@ -1,0 +1,15 @@
+classes:
+  - name: person
+    prompt: person
+  - name: dog
+    prompt: dog
+  - name: cat
+    prompt: cat
+  - name: car
+    prompt: car
+  - name: bicycle
+    prompt: bicycle
+  - name: tree
+    prompt: tree
+  - name: building
+    prompt: building

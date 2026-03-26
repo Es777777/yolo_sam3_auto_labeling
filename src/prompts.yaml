@@ -1,0 +1,9 @@
+classes:
+  - name: person
+    prompt: person
+  - name: bed
+    prompt: bed
+  - name: pillow
+    prompt: pillow
+  - name: lamp
+    prompt: lamp
