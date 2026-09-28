@@ -69,7 +69,8 @@ def test_main_smoke_runs_with_mocked_components(monkeypatch, tmp_path):
     )
 
     def fake_infer_instances(
-        processor, image_path, prompts, min_mask_area, min_box_size, max_polygon_points
+        processor, image_path, prompts, min_mask_area, min_box_size, max_polygon_points,
+        max_instances_per_image, ensure_one_instance,
     ):
         if image_path.name == "sample.jpg":
             return []
@@ -77,7 +78,7 @@ def test_main_smoke_runs_with_mocked_components(monkeypatch, tmp_path):
             {
                 "class_id": 0,
                 "class_name": prompts[0].class_name,
-                "prompt": prompts[0].prompt,
+                "prompt": prompts[0].prompts[0],
                 "score": 0.9,
                 "mask": np.ones((8, 8), dtype=bool),
                 "box_xyxy": [0.0, 0.0, 7.0, 7.0],

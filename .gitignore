@@ -142,6 +142,12 @@ sam3_logs/
 *.npy
 *.npz
 
+# Local image collections and extracted datasets
+src/images/*
+src/videos/*
+!src/images/.gitkeep
+!src/videos/.gitkeep
+
 # Logs
 logs/
 runs/

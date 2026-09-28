@@ -1,4 +1,20 @@
-# SAM3 Auto Label Pipeline
+# SAM3 Text Auto Label Pipeline
+
+## Local Desktop App
+
+Run the native desktop labeling tool:
+
+```bash
+bash start.sh
+```
+
+Choose an image folder or ZIP archive, enter one text target per line, run SAM3, then review boxes and polygons in the built-in viewer. The original images are not modified. Results preserve relative paths under `images/`, `labels_detect/`, and `labels_segment/`.
+
+## 新版文本标注工作台
+
+现在可通过浏览器输入文本、批量标注、人工复核并导出 YOLO 检测或分割数据集。
+在上一级目录运行 `bash start.sh`，打开 http://127.0.0.1:7860 。
+完整中文说明见 [../README.md](../README.md)。新版入口为 `label_tool.py`；以下内容为旧命令行流程。
 
 A personal project for turning image and video collections into YOLO segmentation datasets with SAM3 text prompts.
 
@@ -45,7 +61,7 @@ The main entrypoint is `auto_label_pipeline.py`.
 └── pyproject.toml              # project metadata and dependencies
 ```
 
-## Quick Start
+## Desktop Quick Start
 
 1. Create an environment and install dependencies.
 
@@ -57,36 +73,29 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
-2. Prepare inputs in `src/`.
+2. Start the desktop tool.
 
-- `src/images/`: images to label
-- `src/videos/`: videos to split into frames and label
-- `src/prompts.yaml`: class names and English prompts
-
-Example prompt file:
-
-```yaml
-classes:
-  - name: person
-    prompt: person in an indoor room
-  - name: chair
-    prompt: chair in an indoor room
+```bash
+bash start.sh
 ```
 
-3. Run the pipeline.
+Enter prompts like:
+
+```text
+人 = person
+汽车 = car
+安全帽 = safety helmet | hard hat
+```
+
+The older command line pipeline remains available:
 
 ```bash
 python auto_label_pipeline.py --src-dir src --output-dir runs/auto_label --overwrite
 ```
 
-4. Inspect outputs.
+## CUDA and CPU
 
-- `runs/auto_label/dataset/images`
-- `runs/auto_label/dataset/labels`
-- `runs/auto_label/dataset.yaml`
-- `runs/auto_label/manifest.json`
-
-## CUDA Validation
+The desktop app uses CUDA automatically when available. Set `SAM3_PYTHON=/path/to/python` to select another environment. Place the local checkpoint at `checkpoints/sam3.pt`; it is intentionally ignored by Git.
 
 The pipeline has been validated locally on CUDA with:
 
@@ -112,7 +121,7 @@ scripts/run_tests.sh tests/test_auto_label_pipeline.py
 
 - `checkpoints/` is ignored and should stay local
 - `runs/` is ignored and should stay local
-- `src/` and `test_inputs/` contain lightweight sample inputs for validation
+- `test_inputs/` contains lightweight sample inputs for validation; personal image collections under `src/` are ignored
 - the repository keeps the SAM3 package code needed by the pipeline, while the project presentation is focused on the auto-labeling workflow
 
 ## License

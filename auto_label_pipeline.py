@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
+import gc
 import numpy as np
 import torch
 import yaml
@@ -32,7 +33,18 @@ DEFAULT_MODELSCOPE_CKPT_URL = (
 class LabelPrompt:
     class_id: int
     class_name: str
+    prompts: List[str]
+
+
+@dataclass
+class CandidateRecord:
+    class_id: int
+    class_name: str
     prompt: str
+    score: float
+    mask: np.ndarray
+    box_xyxy: List[float]
+    polygon: List[float]
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,6 +121,39 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Remove previous output directory before running.",
     )
+    parser.add_argument(
+        "--include-pattern",
+        default=None,
+        help="Only process files whose basename contains this substring.",
+    )
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="Start index after filtering inputs.",
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=None,
+        help="Optional max number of images to process from start-index.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip images whose output label file already exists.",
+    )
+    parser.add_argument(
+        "--max-instances-per-image",
+        type=int,
+        default=2,
+        help="Maximum number of instances to keep for each image.",
+    )
+    parser.add_argument(
+        "--ensure-one-instance",
+        action="store_true",
+        help="If no prediction passes threshold, keep the single best candidate for the image.",
+    )
     return parser.parse_args()
 
 
@@ -134,17 +179,31 @@ def load_prompts(prompts_path: Path) -> List[LabelPrompt]:
     for class_id, item in enumerate(raw_classes):
         if isinstance(item, str):
             class_name = item.strip()
-            prompt = class_name
+            prompts_for_class = [class_name]
         elif isinstance(item, dict):
             class_name = str(item.get("name", "")).strip()
-            prompt = str(item.get("prompt", class_name)).strip()
+            raw_prompts = item.get("prompts")
+            if raw_prompts is None:
+                raw_prompt = str(item.get("prompt", class_name)).strip()
+                prompts_for_class = [raw_prompt]
+            elif isinstance(raw_prompts, list):
+                prompts_for_class = [str(prompt).strip() for prompt in raw_prompts]
+            else:
+                raise ValueError(
+                    f"Invalid prompts entry in prompts.yaml: {raw_prompts!r}"
+                )
         else:
             raise ValueError(f"Invalid class entry in prompts.yaml: {item!r}")
 
-        if not class_name or not prompt:
+        prompts_for_class = [prompt for prompt in prompts_for_class if prompt]
+        if not class_name or not prompts_for_class:
             raise ValueError(f"Invalid class entry in prompts.yaml: {item!r}")
         prompts.append(
-            LabelPrompt(class_id=class_id, class_name=class_name, prompt=prompt)
+            LabelPrompt(
+                class_id=class_id,
+                class_name=class_name,
+                prompts=prompts_for_class,
+            )
         )
 
     return prompts
@@ -157,6 +216,12 @@ def collect_files(directory: Path, suffixes: Sequence[str]) -> List[Path]:
         for path in directory.rglob("*")
         if path.is_file() and path.suffix.lower() in suffixes_lower
     )
+
+
+def filter_files(files: Sequence[Path], include_pattern: Optional[str]) -> List[Path]:
+    if not include_pattern:
+        return list(files)
+    return [path for path in files if include_pattern in path.name]
 
 
 def prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
@@ -250,6 +315,25 @@ def suppress_cross_class_duplicates(
     return kept
 
 
+def finalize_records(
+    accepted: List[CandidateRecord],
+    fallback: List[CandidateRecord],
+    ensure_one_instance: bool,
+    max_instances_per_image: int,
+) -> List[Dict[str, object]]:
+    if accepted:
+        chosen = accepted
+    elif ensure_one_instance and fallback:
+        chosen = [max(fallback, key=lambda item: item.score)]
+    else:
+        chosen = []
+
+    chosen_records = [record.__dict__.copy() for record in chosen]
+    deduped = suppress_cross_class_duplicates(chosen_records)
+    deduped.sort(key=lambda item: float(item["score"]), reverse=True)
+    return deduped[:max_instances_per_image]
+
+
 def write_yolo_label_file(
     label_path: Path, instances: Iterable[Dict[str, object]]
 ) -> None:
@@ -314,44 +398,55 @@ def infer_instances(
     min_mask_area: int,
     min_box_size: int,
     max_polygon_points: int,
+    max_instances_per_image: int,
+    ensure_one_instance: bool,
 ) -> List[Dict[str, object]]:
-    image = Image.open(image_path).convert("RGB")
+    with Image.open(image_path) as source_image:
+        image = source_image.convert("RGB")
     state = processor.set_image(image)
 
-    records: List[Dict[str, object]] = []
+    accepted_records: List[CandidateRecord] = []
+    fallback_records: List[CandidateRecord] = []
     for prompt in prompts:
-        state = processor.set_text_prompt(prompt.prompt, state)
-        masks = state["masks"].detach().cpu().numpy().astype(bool)
-        boxes = state["boxes"].detach().cpu().numpy()
-        scores = state["scores"].detach().cpu().numpy()
+        for prompt_text in prompt.prompts:
+            state = processor.set_text_prompt(prompt_text, state)
+            masks = state["masks"].detach().cpu().numpy().astype(bool)
+            boxes = state["boxes"].detach().float().cpu().numpy()
+            scores = state["scores"].detach().float().cpu().numpy()
 
-        for mask, box, score in zip(masks, boxes, scores):
-            x1, y1, x2, y2 = [float(v) for v in box.tolist()]
-            width = x2 - x1
-            height = y2 - y1
-            area = int(mask.sum())
-            if area < min_mask_area:
-                continue
-            if width < min_box_size or height < min_box_size:
-                continue
-            polygon = mask_to_yolo_polygon(mask, max_polygon_points)
-            if polygon is None:
-                continue
-            records.append(
-                {
-                    "class_id": prompt.class_id,
-                    "class_name": prompt.class_name,
-                    "prompt": prompt.prompt,
-                    "score": float(score),
-                    "mask": mask,
-                    "box_xyxy": [x1, y1, x2, y2],
-                    "polygon": polygon,
-                }
-            )
+            for mask, box, score in zip(masks, boxes, scores):
+                x1, y1, x2, y2 = [float(v) for v in box.tolist()]
+                width = x2 - x1
+                height = y2 - y1
+                area = int(mask.sum())
+                if area < min_mask_area:
+                    continue
+                if width < min_box_size or height < min_box_size:
+                    continue
+                polygon = mask_to_yolo_polygon(mask, max_polygon_points)
+                if polygon is None:
+                    continue
+                record = CandidateRecord(
+                    class_id=prompt.class_id,
+                    class_name=prompt.class_name,
+                    prompt=prompt_text,
+                    score=float(score),
+                    mask=mask,
+                    box_xyxy=[x1, y1, x2, y2],
+                    polygon=polygon,
+                )
+                fallback_records.append(record)
+                if float(score) >= processor.confidence_threshold:
+                    accepted_records.append(record)
 
-        processor.reset_all_prompts(state)
+            processor.reset_all_prompts(state)
 
-    return suppress_cross_class_duplicates(records)
+    return finalize_records(
+        accepted=accepted_records,
+        fallback=fallback_records,
+        ensure_one_instance=ensure_one_instance,
+        max_instances_per_image=max_instances_per_image,
+    )
 
 
 def relative_output_name(src_root: Path, file_path: Path) -> str:
@@ -367,6 +462,9 @@ def process_images(
     min_mask_area: int,
     min_box_size: int,
     max_polygon_points: int,
+    skip_existing: bool,
+    max_instances_per_image: int,
+    ensure_one_instance: bool,
 ) -> List[Dict[str, object]]:
     dataset_images_dir = output_dir / "dataset" / "images"
     dataset_labels_dir = output_dir / "dataset" / "labels"
@@ -376,6 +474,18 @@ def process_images(
         output_stem = Path(relative_output_name(src_dir, image_path)).with_suffix("")
         out_image_path = dataset_images_dir / f"{output_stem}.jpg"
         out_label_path = dataset_labels_dir / f"{output_stem}.txt"
+        if skip_existing and out_label_path.exists():
+            print(f"[skip] {image_path.name}: label exists")
+            manifest.append(
+                {
+                    "source": str(image_path),
+                    "image": str(out_image_path),
+                    "label": str(out_label_path),
+                    "num_instances": None,
+                    "skipped": True,
+                }
+            )
+            continue
         out_image_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(image_path, out_image_path)
 
@@ -386,6 +496,8 @@ def process_images(
             min_mask_area=min_mask_area,
             min_box_size=min_box_size,
             max_polygon_points=max_polygon_points,
+            max_instances_per_image=max_instances_per_image,
+            ensure_one_instance=ensure_one_instance,
         )
         write_yolo_label_file(out_label_path, instances)
         manifest.append(
@@ -397,6 +509,9 @@ def process_images(
             }
         )
         print(f"[image] {image_path.name}: {len(instances)} instances")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return manifest
 
@@ -411,6 +526,9 @@ def process_videos(
     min_box_size: int,
     max_polygon_points: int,
     frame_fps: Optional[float],
+    skip_existing: bool,
+    max_instances_per_image: int,
+    ensure_one_instance: bool,
 ) -> List[Dict[str, object]]:
     manifest: List[Dict[str, object]] = []
     extracted_root = output_dir / "extracted_frames"
@@ -430,6 +548,9 @@ def process_videos(
                 min_mask_area=min_mask_area,
                 min_box_size=min_box_size,
                 max_polygon_points=max_polygon_points,
+                skip_existing=skip_existing,
+                max_instances_per_image=max_instances_per_image,
+                ensure_one_instance=ensure_one_instance,
             )
         )
 
@@ -454,14 +575,17 @@ def write_dataset_yaml(output_dir: Path, prompts: Sequence[LabelPrompt]) -> Path
 def write_manifest(
     output_dir: Path, prompts: Sequence[LabelPrompt], items: Sequence[Dict[str, object]]
 ) -> None:
+    manifest_path = output_dir / "manifest.json"
     serializable_items = []
-    for item in items:
-        serializable_items.append(item)
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        serializable_items.extend(existing.get("items", []))
+    serializable_items.extend(items)
     manifest = {
         "classes": [prompt.__dict__ for prompt in prompts],
         "items": serializable_items,
     }
-    (output_dir / "manifest.json").write_text(
+    manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
@@ -480,8 +604,16 @@ def main() -> int:
     prepare_output_dir(output_dir, args.overwrite)
 
     prompts = load_prompts(prompts_path)
-    images = collect_files(src_dir / "images", IMAGE_EXTS)
-    videos = collect_files(src_dir / "videos", VIDEO_EXTS)
+    images = filter_files(
+        collect_files(src_dir / "images", IMAGE_EXTS), args.include_pattern
+    )
+    videos = filter_files(
+        collect_files(src_dir / "videos", VIDEO_EXTS), args.include_pattern
+    )
+    if args.start_index:
+        images = images[args.start_index :]
+    if args.max_images is not None:
+        images = images[: args.max_images]
 
     if not images and not videos:
         raise RuntimeError(
@@ -510,6 +642,9 @@ def main() -> int:
                 min_mask_area=args.min_mask_area,
                 min_box_size=args.min_box_size,
                 max_polygon_points=args.max_polygon_points,
+                skip_existing=args.skip_existing,
+                max_instances_per_image=args.max_instances_per_image,
+                ensure_one_instance=args.ensure_one_instance,
             )
         )
     if videos:
@@ -524,6 +659,9 @@ def main() -> int:
                 min_box_size=args.min_box_size,
                 max_polygon_points=args.max_polygon_points,
                 frame_fps=args.frame_fps,
+                skip_existing=args.skip_existing,
+                max_instances_per_image=args.max_instances_per_image,
+                ensure_one_instance=args.ensure_one_instance,
             )
         )
 
